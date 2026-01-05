@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+.DS_Store
+node_modules/
+*.pkl
+*.h5
+*.keras
