@@ -66,11 +66,11 @@ function App() {
     await sendToBackend("/predict-combined", formData);
   };
 
-  // --- API HELPER ---
+  // --- API HELPER (UPDATED) ---
   const sendToBackend = async (endpoint, formData) => {
     try {
-      // ✅ CHANGED PORT TO 5001 HERE
-      const response = await fetch(`http://localhost:5001${endpoint}`, {
+      // ✅ CONNECTED TO LIVE RENDER BACKEND
+      const response = await fetch(`https://parkinsons-backend-40ys.onrender.com${endpoint}`, {
         method: "POST",
         body: formData,
       });
