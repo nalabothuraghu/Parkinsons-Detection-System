@@ -21,18 +21,30 @@ if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
 # ==========================================
-# 2. LOAD MODELS
+# 2. LOAD MODELS & DATA ONCE (AT STARTUP)
 # ==========================================
-print("⏳ Loading Models...")
-spiral_model = None
+print("⏳ Loading Models and Data into memory...")
+
+# Global variables
+spiral_interpreter = None
+spiral_input_details = None
+spiral_output_details = None
 speech_model = None
 speech_scaler = None
+excel_data = None  # Stores the merged dataframe
 
 try:
-    if os.path.exists('spiral_mobilenet.keras'):
-        spiral_model = tf.keras.models.load_model('spiral_mobilenet.keras')
-        print("✅ Spiral Model loaded.")
-    
+    # --- A. Load Fast TFLite Model ---
+    if os.path.exists('spiral_mobilenet.tflite'):
+        spiral_interpreter = tf.lite.Interpreter(model_path='spiral_mobilenet.tflite')
+        spiral_interpreter.allocate_tensors()
+        spiral_input_details = spiral_interpreter.get_input_details()
+        spiral_output_details = spiral_interpreter.get_output_details()
+        print("✅ Fast TFLite Spiral Model loaded.")
+    else:
+        print("⚠️ Warning: spiral_mobilenet.tflite not found. Run the conversion script!")
+
+    # --- B. Load Voice Models ---
     if os.path.exists('parkinsons_best_model.pkl'):
         speech_model = load("parkinsons_best_model.pkl")
         print("✅ Speech Model loaded.")
@@ -41,75 +53,75 @@ try:
         speech_scaler = load("speech_scaler.pkl")
         print("✅ Speech Scaler loaded.")
 
+    # --- C. Pre-load Excel Data (MASSIVE SPEED BOOST) ---
+    print("⏳ Reading Excel sheets (this only happens once)...")
+    sheets = ['Parselmouth', 'LPC_means', 'LAR_means', 'Cep_means', 
+              'MFCC_means', 'LPC_vars', 'LAR_vars', 'Cep_vars', 'MFCC_vars']
+    
+    dfs = {name: pd.read_excel(EXCEL_PATH, sheet_name=name) for name in sheets}
+    
+    for name, df in dfs.items():
+        df.columns = df.columns.str.strip()
+        if 'Sample ID' in df.columns:
+            df.rename(columns={'Sample ID': 'Sample'}, inplace=True)
+            
+    excel_data = dfs['Parselmouth']
+    for name in sheets[1:]:
+        df_to_merge = dfs[name].drop(columns=['Label'], errors='ignore')
+        excel_data = pd.merge(excel_data, df_to_merge, on='Sample', how='inner')
+        
+    print("✅ Excel Data loaded and merged into memory.")
+
 except Exception as e:
-    print(f"❌ Error loading models: {e}")
+    print(f"❌ Error during initialization: {e}")
+
 
 # ==========================================
 # 3. HELPER FUNCTIONS
 # ==========================================
 
 def process_spiral_image(filepath):
-    """ Resizes to 128x128 and normalizes for the Image Model. """
+    """ Resizes to 128x128, normalizes, and casts to float32 for TFLite. """
     img = cv2.imread(filepath)
     if img is None: raise ValueError("Could not read image.")
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img = cv2.resize(img, (128, 128))
-    img = img / 255.0
+    # TFLite requires float32
+    img = img.astype(np.float32) / 255.0
     img = np.expand_dims(img, axis=0)
     return img
 
-def get_features_from_excel(filename):
-    """
-    Replicates the EXACT merge logic from your speech_binary.py
-    to find features for a specific file.
-    """
-    # 1. Get ID from filename (e.g., '101_AUDIO.wav' -> '101_AUDIO')
+def predict_spiral_tflite(img):
+    """ Helper to run the fast TFLite prediction """
+    spiral_interpreter.set_tensor(spiral_input_details[0]['index'], img)
+    spiral_interpreter.invoke()
+    pred = spiral_interpreter.get_tensor(spiral_output_details[0]['index'])
+    return float(pred[0][0])
+
+def get_features_from_memory(filename):
+    """ Grabs features instantly from RAM instead of reading the file. """
+    if excel_data is None:
+        raise Exception("Excel data failed to load at startup.")
+
     sample_id = os.path.splitext(filename)[0]
 
-    # 2. Load all sheets (Same list as your training script)
-    sheets = ['Parselmouth', 'LPC_means', 'LAR_means', 'Cep_means', 
-              'MFCC_means', 'LPC_vars', 'LAR_vars', 'Cep_vars', 'MFCC_vars']
-    
-    try:
-        # Read Excel
-        dfs = {name: pd.read_excel(EXCEL_PATH, sheet_name=name) for name in sheets}
-    except Exception:
-        raise Exception(f"Could not find or open '{EXCEL_PATH}'")
-
-    # 3. Clean Columns (Exactly as in your script)
-    for name, df in dfs.items():
-        df.columns = df.columns.str.strip()
-        if 'Sample ID' in df.columns:
-            df.rename(columns={'Sample ID': 'Sample'}, inplace=True)
-            
-    # 4. Merge Sheets (Exactly as in your script)
-    merged = dfs['Parselmouth']
-    for name in sheets[1:]:
-        # Drop 'Label' if it exists in subsequent sheets to avoid duplication
-        df_to_merge = dfs[name].drop(columns=['Label'], errors='ignore')
-        merged = pd.merge(merged, df_to_merge, on='Sample', how='inner')
-
-    # 5. Find the row for this specific file
-    row = merged[merged['Sample'] == sample_id]
+    # Find row in pre-loaded data (using .copy() to prevent Pandas warnings)
+    row = excel_data[excel_data['Sample'] == sample_id].copy()
     
     if row.empty:
         raise ValueError(f"ID '{sample_id}' not found in Excel. Use a dataset file.")
 
-    # 6. Process Sex (Map 'M'->1, 'F'->0)
     if 'Sex' in row.columns:
         row['Sex'] = row['Sex'].map({'M': 1, 'F': 0})
 
-    # 7. Drop Non-Features
     X_row = row.drop(columns=['Sample', 'Label'], errors='ignore')
     
-    # 8. Scale (Crucial!)
     if speech_scaler:
-        # Fill NaNs with 0 (safe fallback) or mean if possible
         X_row = X_row.fillna(0)
-        X_scaled = speech_scaler.transform(X_row)
-        return X_scaled
+        return speech_scaler.transform(X_row)
     else:
         return X_row.values
+
 
 # ==========================================
 # 4. API ROUTES
@@ -123,10 +135,11 @@ def predict_spiral():
     file.save(path)
 
     try:
-        if not spiral_model: return jsonify({'error': 'Model not loaded'}), 500
+        if not spiral_interpreter: return jsonify({'error': 'TFLite Model not loaded'}), 500
+        
         img = process_spiral_image(path)
-        pred = spiral_model.predict(img)
-        prob = float(pred[0][0])
+        prob = predict_spiral_tflite(img)
+        
         return jsonify({'detected': prob > 0.5, 'confidence': f"{prob:.2f}"})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -136,7 +149,6 @@ def predict_voice():
     if 'file' not in request.files: return jsonify({'error': 'No file'}), 400
     
     file = request.files['file']
-    # KEEP ORIGINAL FILENAME so we can look it up in Excel
     filename = secure_filename(file.filename) 
     path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(path)
@@ -144,10 +156,9 @@ def predict_voice():
     try:
         if not speech_model: return jsonify({'error': 'Voice model not loaded'}), 500
 
-        # Get features using Excel Lookup
-        features = get_features_from_excel(filename)
+        # Get features instantly from memory
+        features = get_features_from_memory(filename)
         
-        # Predict
         pred = speech_model.predict(features)
         prob = speech_model.predict_proba(features)[0, 1]
         
@@ -168,8 +179,6 @@ def predict_combined():
     v_file = request.files['voice_file']
     
     s_path = os.path.join(UPLOAD_FOLDER, secure_filename(s_file.filename))
-    
-    # Keep original audio name for lookup
     v_name = secure_filename(v_file.filename) 
     v_path = os.path.join(UPLOAD_FOLDER, v_name)
     
@@ -177,12 +186,12 @@ def predict_combined():
     v_file.save(v_path)
 
     try:
-        # Spiral
+        # Fast Spiral Prediction
         s_img = process_spiral_image(s_path)
-        s_prob = float(spiral_model.predict(s_img)[0][0])
+        s_prob = predict_spiral_tflite(s_img)
 
-        # Voice
-        v_feat = get_features_from_excel(v_name)
+        # Fast Voice Prediction
+        v_feat = get_features_from_memory(v_name)
         v_prob = speech_model.predict_proba(v_feat)[0, 1]
 
         # Fusion
