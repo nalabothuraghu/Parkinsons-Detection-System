@@ -4,6 +4,9 @@ import cv2
 import pandas as pd
 from skimage import feature
 from joblib import load
+import librosa
+import parselmouth
+from scipy.stats import skew, kurtosis
 
 # =============================
 # 1️⃣ Load Models & Scaler
@@ -11,8 +14,9 @@ from joblib import load
 spiral_model = load("spiral_model.pkl")
 speech_model = load("parkinsons_best_model.pkl")
 speech_scaler = load("speech_scaler.pkl")
+feature_order = load("feature_order.pkl")
 
-print("[INFO] Models and Scaler loaded successfully!")
+print("[INFO] Models, Scaler, and Feature Order loaded successfully!")
 
 # =============================
 # 2️⃣ Spiral Feature Extraction (UNCHANGED)
@@ -28,72 +32,82 @@ def quantify_image(image):
     )
 
 # =============================
-# 3️⃣ Extract Sample ID from Audio Path
+# 3️⃣ Speech Feature Extraction (WAV-BASED, SAME AS TRAINING)
 # =============================
-def get_sample_id_from_audio(audio_path):
-    """
-    Example:
-    AH_545622720-E1486AF6-8C95-47EB-829B-4D62698C987A.wav
-    → AH_545622720-E1486AF6-8C95-47EB-829B-4D62698C987A
-    """
-    return os.path.splitext(os.path.basename(audio_path))[0]
+
+SAMPLE_RATE = 16000
+N_MFCC = 13
+LPC_ORDER = 16
+
+def extract_speech_features_from_wav(wav_path):
+    features = {}
+
+    # Load audio
+    y, sr = librosa.load(wav_path, sr=SAMPLE_RATE, mono=True)
+
+    # MFCC
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=N_MFCC)
+    for i in range(N_MFCC):
+        features[f"MFCC{i+1}_mean"] = np.mean(mfcc[i])
+        features[f"MFCC{i+1}_var"]  = np.var(mfcc[i])
+        features[f"MFCC{i+1}_skew"] = skew(mfcc[i])
+        features[f"MFCC{i+1}_kurt"] = kurtosis(mfcc[i])
+
+    # LPC
+    lpc = librosa.lpc(y, order=LPC_ORDER)
+    for i, coef in enumerate(lpc):
+        features[f"LPC{i+1}"] = coef
+
+    # Cepstral
+    spectrum = np.abs(np.fft.fft(y))
+    cepstrum = np.fft.ifft(np.log(spectrum + 1e-10)).real
+    features["Cep_mean"] = np.mean(cepstrum)
+    features["Cep_var"]  = np.var(cepstrum)
+
+    # Parselmouth (Praat-based)
+    snd = parselmouth.Sound(wav_path)
+
+    pitch = snd.to_pitch()
+    features["Pitch_mean"] = np.nanmean(pitch.selected_array['frequency'])
+    features["Pitch_std"]  = np.nanstd(pitch.selected_array['frequency'])
+
+    point_process = parselmouth.praat.call(
+        snd, "To PointProcess (periodic, cc)", 75, 500
+    )
+
+    features["Jitter_local"] = parselmouth.praat.call(
+        point_process, "Get jitter (local)",
+        0, 0, 0.0001, 0.02, 1.3
+    )
+
+    features["Shimmer_local"] = parselmouth.praat.call(
+        [snd, point_process], "Get shimmer (local)",
+        0, 0, 0.0001, 0.02, 1.3, 1.6
+    )
+
+    # Energy
+    features["RMS_energy"] = np.mean(librosa.feature.rms(y=y))
+
+    # Convert to DataFrame & align features
+    df = pd.DataFrame([features])
+    df = df.reindex(columns=feature_order, fill_value=0)
+
+    # Scale
+    df_scaled = speech_scaler.transform(df)
+
+    return df_scaled
 
 # =============================
-# 4️⃣ Load SINGLE Audio Features from Excel
-# =============================
-def load_audio_features_from_excel(excel_file, audio_path):
-    sample_id = get_sample_id_from_audio(audio_path)
-
-    sheets = [
-        'Parselmouth', 'LPC_means', 'LAR_means', 'Cep_means',
-        'MFCC_means', 'LPC_vars', 'LAR_vars', 'Cep_vars', 'MFCC_vars'
-    ]
-
-    dfs = {s: pd.read_excel(excel_file, sheet_name=s) for s in sheets}
-
-    # Clean column names
-    for df in dfs.values():
-        df.columns = df.columns.str.strip()
-        if 'Sample ID' in df.columns:
-            df.rename(columns={'Sample ID': 'Sample'}, inplace=True)
-        if 'Label' in df.columns:
-            df['Label'] = df['Label'].astype(str).str.strip()
-
-    # Merge exactly like training
-    merged = dfs['Parselmouth']
-    for s in sheets[1:]:
-        df = dfs[s].drop(columns=['Label'], errors='ignore')
-        merged = pd.merge(merged, df, on='Sample', how='inner')
-
-    # Select sample
-    row = merged[merged['Sample'] == sample_id]
-    if row.empty:
-        raise ValueError(f"[ERROR] Sample ID '{sample_id}' not found in Excel")
-
-    # Encode sex
-    row['Sex'] = row['Sex'].map({'M': 1, 'F': 0})
-
-    X = row.drop(columns=['Sample', 'Label'], errors='ignore')
-    X = X.select_dtypes(include=np.number)
-    X = X.fillna(X.mean())
-
-    # Apply SAME scaler
-    X_scaled = speech_scaler.transform(X)
-
-    return X_scaled, sample_id
-
-# =============================
-# 🧪 Single Test Function
+# 🧪 Single Test Function (FUSION)
 # =============================
 def test_single_input(
     spiral_file,
     audio_file,
-    excel_file,
     weight_speech=0.65,
     weight_spiral=0.35,
     threshold=0.45
 ):
-    print("\n[INFO] Running single-sample test...")
+    print("\n[INFO] Running single-sample fusion test...")
 
     # -------- Spiral --------
     img = cv2.imread(spiral_file)
@@ -111,8 +125,8 @@ def test_single_input(
     spiral_prob = spiral_model.predict_proba(spiral_feat)[0, 1]
     spiral_pred = spiral_model.predict(spiral_feat)[0]
 
-    # -------- Audio (via Excel lookup) --------
-    speech_feat, sample_id = load_audio_features_from_excel(excel_file, audio_file)
+    # -------- Speech (RAW WAV → FEATURES) --------
+    speech_feat = extract_speech_features_from_wav(audio_file)
     speech_prob = speech_model.predict_proba(speech_feat)[0, 1]
     speech_pred = speech_model.predict(speech_feat)[0]
 
@@ -124,8 +138,6 @@ def test_single_input(
     fused_label = int(fused_prob > threshold)
 
     # -------- Output --------
-    print(f"\n🔹 Sample ID: {sample_id}")
-
     print("\n🔹 Spiral Model:")
     print(f"   Probability : {spiral_prob:.3f}")
     print(f"   Prediction  : {'Parkinson’s' if spiral_pred else 'Healthy'}")
@@ -150,14 +162,12 @@ def test_single_input(
 if __name__ == "__main__":
     print("\n================= TESTING SECTION =================")
 
-    spiral_path = r"C:\Users\DELL\OneDrive\Desktop\datasetnew\spiral\testing\healthy\V55HE14.png"
-    audio_path = r"C:\Users\DELL\OneDrive\Desktop\datasetnew\PD_AH\AH_545841227-5C77713A-66F1-49D0-BC8A-702C152E668D.wav"
-    excel_path = r"C:\Users\DELL\OneDrive\Desktop\datasetnew\Demographics_age_sex.xlsx"
+    spiral_path = r"C:\Users\DELL\OneDrive\Desktop\datasetnew\spiral\testing\parkinson\V01PE01.png"
+    audio_path  = r"C:\Users\DELL\OneDrive\Desktop\datasetnew\HC_AH\AH_325A_3EB21DC7-C340-4D0E-AC9E-0EABF217BBEE.wav"
 
     test_single_input(
         spiral_path,
         audio_path,
-        excel_path,
         weight_speech=0.65,
         weight_spiral=0.35,
         threshold=0.45

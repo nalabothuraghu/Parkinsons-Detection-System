@@ -1,4 +1,3 @@
-# USASGE
 # python detect_parkinsons.py --dataset dataset/spiral
 # python detect_parkinsons.py --dataset dataset/wave
 
